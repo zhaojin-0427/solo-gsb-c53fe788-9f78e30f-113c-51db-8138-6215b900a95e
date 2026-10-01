@@ -11,13 +11,21 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .model import Waypoint, make_sortie
-from .schemas import ImportPayload, LockEntry, SaveRequest, SolveRequest
+from .schemas import (
+    CreateBatchRequest,
+    ImportPayload,
+    LockEntry,
+    ReportRequest,
+    SaveRequest,
+    SolveRequest,
+)
 from .solver import (
     PairConstraint,
     build_pair_constraints,
     run_solve,
     scan_schedule,
 )
+from .batch import EarlyTimeReject, Report, evaluate_warning
 from .storage import Store
 
 DB_PATH = os.environ.get("DCC_DB_PATH", "data/console.db")
@@ -182,6 +190,141 @@ def save_scenario(sid: int, req: SaveRequest):
     store.save_result(sid, row["result"], row["safety_radius"], row["safety_height"],
                       name=req.name)
     return {"scenario_id": sid, "name": req.name, "saved": True}
+
+
+# ---------------------------------------------------------------------------
+# Execution batches: frozen plan + actual-take-off reports + warning
+# ---------------------------------------------------------------------------
+
+
+def _build_batch(row: dict):
+    payload = ImportPayload.model_validate(row["input"])
+    sorties, _, _ = _build_sorties(payload)
+    reports = {
+        r["sortie_id"]: Report(r["actual_offset"], r["revision"])
+        for r in row["reports"]
+    }
+    return sorties, reports
+
+
+def _batch_summary(row: dict) -> dict:
+    return {
+        "batch_id": row["id"],
+        "scenario_id": row["scenario_id"],
+        "name": row["name"],
+        "safety_radius": row["safety_radius"],
+        "safety_height": row["safety_height"],
+        "created_at": row["created_at"],
+        "planned_offsets": row["plan"]["offsets"],
+        "reports": [
+            {"sortie_id": r["sortie_id"], "actual_offset": r["actual_offset"],
+             "revision": r["revision"], "reported_at": r["reported_at"]}
+            for r in row["reports"]
+        ],
+    }
+
+
+@app.post("/api/scenarios/{sid}/batches", status_code=201)
+def create_batch(sid: int, req: CreateBatchRequest):
+    row = store.get_scenario(sid)
+    if row is None:
+        raise HTTPException(404, "scenario not found")
+    result = row["result"]
+    if result is None or not result.get("feasible"):
+        raise HTTPException(
+            400, "a feasible plan must be solved before creating an execution batch")
+    # Freeze the input snapshot, safety thresholds and planned offsets; later
+    # re-solves of the scenario never mutate this batch.
+    plan = {"offsets": dict(result["offsets"])}
+    bid = store.create_batch(
+        sid, req.name, row["input"], row["safety_radius"], row["safety_height"], plan)
+    batch = store.get_batch(bid)
+    return _batch_summary(batch)
+
+
+@app.get("/api/batches")
+def list_batches(scenario_id: int | None = None):
+    return {"batches": store.list_batches(scenario_id)}
+
+
+@app.get("/api/batches/{bid}")
+def get_batch(bid: int):
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    return _batch_summary(row)
+
+
+@app.delete("/api/batches/{bid}")
+def delete_batch(bid: int):
+    if not store.delete_batch(bid):
+        raise HTTPException(404, "batch not found")
+    return {"deleted": bid}
+
+
+@app.put("/api/batches/{bid}/reports")
+def put_report(bid: int, req: ReportRequest):
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    known = {s["id"] for s in row["input"]["sorties"]}
+    if req.sortie_id not in known:
+        raise HTTPException(404, f"sortie not found in batch: {req.sortie_id}")
+    # Atomic compare-and-set: identical retries are idempotent, same revision
+    # with a different value or an older revision conflicts, and concurrent
+    # reports leave only the highest revision stored.
+    outcome, info = store.submit_report(
+        bid, req.sortie_id, req.actual_offset, req.revision)
+    if outcome in ("idempotent", "inserted"):
+        return {"batch_id": bid, "report": info, "accepted": True,
+                "idempotent": outcome == "idempotent"}
+    if outcome == "invalid_first_revision":
+        raise HTTPException(409, detail={
+            "reason": "invalid_first_revision",
+            "sortie_id": req.sortie_id,
+            "received_revision": req.revision,
+            "expected_revision": 1,
+        })
+    if outcome == "revision_value_conflict":
+        raise HTTPException(409, detail={
+            "reason": "revision_value_conflict",
+            "sortie_id": req.sortie_id,
+            "revision": req.revision,
+            "stored_actual_offset": info["stored_actual_offset"],
+            "received_actual_offset": req.actual_offset,
+        })
+    raise HTTPException(409, detail={
+        "reason": "stale_revision",
+        "sortie_id": req.sortie_id,
+        "received_revision": req.revision,
+        "current_revision": info["current_revision"],
+    })
+
+
+@app.get("/api/batches/{bid}/warning")
+def batch_warning(bid: int, t: int):
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    if t < 0:
+        raise HTTPException(400, "t must be a non-negative integer second")
+    sorties, reports = _build_batch(row)
+    try:
+        result = evaluate_warning(
+            sorties, row["plan"]["offsets"], reports,
+            row["safety_radius"], row["safety_height"], t,
+        )
+    except EarlyTimeReject as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "reason": "t_before_reported_takeoff",
+                "t": t,
+                "violations": exc.violations,
+            },
+        )
+    summary = _batch_summary(row)
+    return {**summary, "warning": result}
 
 
 @app.get("/api/health")

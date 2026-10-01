@@ -70,3 +70,15 @@ class SolveRequest(BaseModel):
 
 class SaveRequest(BaseModel):
     name: str = Field(..., min_length=1)
+
+
+class CreateBatchRequest(BaseModel):
+    name: str = Field("", description="optional display name for the batch")
+
+
+class ReportRequest(BaseModel):
+    sortie_id: str = Field(..., min_length=1)
+    actual_offset: int = Field(
+        ..., ge=0, description="actual take-off offset in seconds (non-negative)")
+    revision: int = Field(
+        ..., ge=1, description="report revision, 1 first then strictly increasing")

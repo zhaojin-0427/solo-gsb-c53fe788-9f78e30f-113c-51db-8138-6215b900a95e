@@ -153,6 +153,49 @@ canvas {
 }
 .hidden { display: none !important; }
 
+/* execution batch / deviation warning */
+.bd-head { display: flex; align-items: center; justify-content: space-between; }
+.bd-title { font-weight: 700; font-size: 13px; color: #cdd9f0; }
+.bd-head .h-del { color: var(--bad); cursor: pointer; padding: 0 4px; }
+.t-row { display: flex; gap: 6px; }
+.t-row input {
+  flex: 1; background: #0e1525; color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px;
+}
+.t-row button { padding: 7px 10px; }
+.warn-summary { font-size: 12px; margin: 6px 0; display: flex; flex-direction: column; gap: 3px; }
+.warn-summary .bad { color: var(--bad); font-weight: 600; }
+.warn-summary .ok { color: var(--ok); font-weight: 600; }
+.warn-sorties { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.warn-sortie {
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 8px; font-size: 12px;
+}
+.ws-top { display: flex; align-items: center; gap: 7px; }
+.ws-id { font-weight: 600; }
+.ws-tag { font-size: 11px; padding: 1px 7px; border-radius: 20px; }
+.ws-tag.reported { background: rgba(77,163,255,.18); color: var(--accent); }
+.ws-tag.planned { background: rgba(56,211,159,.15); color: var(--ok); }
+.ws-tag.overdue { background: rgba(255,93,108,.18); color: var(--bad); }
+.ws-meta { color: var(--muted); font-size: 11px; margin-left: auto; }
+.ws-dev { margin-top: 5px; display: flex; gap: 6px; align-items: center; }
+.ws-dev input {
+  width: 74px; background: #0e1525; color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px;
+}
+.ws-dev .dev-val { font-variant-numeric: tabular-nums; }
+.ws-dev .dev-val.pos { color: var(--warn); }
+.ws-dev .dev-val.neg { color: var(--bad); }
+.ws-dev .dev-val.zero { color: var(--ok); }
+.warn-conflicts { margin-top: 8px; font-size: 12px; }
+.warn-conflicts .wc-title { color: var(--warn); font-weight: 600; margin-bottom: 4px; }
+.warn-conflicts .wc-none { color: var(--muted); }
+.wc-line {
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 7px;
+  padding: 5px 8px; margin-bottom: 4px; font-variant-numeric: tabular-nums;
+}
+.batch-item.active { border-color: var(--accent); }
+
 @media (max-width: 980px) {
   .layout { grid-template-columns: 1fr; }
 }

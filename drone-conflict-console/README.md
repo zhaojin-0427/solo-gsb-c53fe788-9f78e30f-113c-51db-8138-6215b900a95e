@@ -29,6 +29,13 @@
 - **无解诊断**：无解时列出若干**包含关系极小**的无解架次集合（删去其中任意一架次，
   其余架次即可消解），并给出每对架次的**互斥时差**（后者起飞 − 前者起飞，秒）。
 - **锁定重算**：在页面勾选锁定并填写某些架次的整数秒偏移，重新求解其余架次。
+- **执行批次与偏差预警**：从已保存的可行方案创建**执行批次**，冻结输入航迹快照、
+  安全阈值与计划偏移；之后对原场景如何重算都不会改变批次。各架次以**非负整数秒
+  实际起飞偏移 + 修订号**（首版 1、严格递增）上报；同号同值重试幂等，同号异值或
+  旧号返回冲突，并发上报只保留最高修订。给定非负当前秒 `t` 做预警：早于任一已
+  上报实际起飞时刻则拒绝；已上报按实际起飞、未上报且计划起飞不早于 `t` 按计划
+  起飞、其余标为**逾期**并排除预测（结果标明“预测不完整”）；沿用连续时间冲突
+  判定返回 `t` 及之后的冲突区间、首个冲突时刻与已上报架次的偏离计划秒数。
 - **可视化对照**：
   - 水平航迹图（最早起飞虚线 / 求解后实线，冲突见证点用红色 ✕ 与安全圆标出）；
   - 甘特式时间轴（红色段为最早起飞时的冲突时间）；
@@ -44,15 +51,16 @@
 ```
 drone-conflict-console/
 ├── app/
-│   ├── main.py          # FastAPI 路由
+│   ├── main.py          # FastAPI 路由（含执行批次 / 上报 / 预警 API）
 │   ├── model.py         # 航迹/航段数据模型
 │   ├── geometry.py      # 连续冲突检测 + 互斥时差解析几何
 │   ├── solver.py        # OR-Tools CP-SAT 建模、字典序择优、无解核枚举
-│   ├── schemas.py       # 导入/求解请求的校验
-│   ├── storage.py       # SQLite 持久化（含输入快照）
+│   ├── batch.py         # 批次预警纯逻辑：状态分类 + 连续时间冲突投影
+│   ├── schemas.py       # 导入/求解/上报请求的校验
+│   ├── storage.py       # SQLite 持久化（场景、方案、批次、上报）
 │   └── static/          # 原生 JS + Canvas 前端（无构建步骤）
 ├── examples/crossroads.json
-├── tests/               # 几何三实现交叉验证 + 求解器暴力枚举验证
+├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
@@ -117,6 +125,13 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
    再点顶部 **重算（应用锁定）**。
 5. 点 **保存当前方案** 命名存档；之后在左下 **已保存方案** 中点击即可
    连同输入快照重新载入，🗑 可删除。
+6. 得到可行方案后，在 **执行批次与偏差预警** 卡片点 **从当前方案创建执行批次**
+   （输入航迹、安全阈值、计划偏移随即冻结）。在批次详情中：
+   - 每个架次一行，填写**非负整数秒实际起飞偏移**后点 **上报**，修订号自动取
+     “当前 +1”（首版为 1）；同号同值重发安全（幂等），同号异值 / 旧号会弹冲突提示。
+   - 填写 **当前秒 t**，点 **评估预警**：状态徽标显示“已上报 / 按计划 / 逾期”，
+     面板给出预测是否完整、首个冲突时刻、各已上报架次偏离计划秒数，以及 `t` 及
+     之后的连续时间冲突区间。页面与 HTTP API 读写同一批次数据。
 
 ---
 
@@ -185,6 +200,12 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `GET` | `/api/scenarios` | 已保存方案列表 |
 | `GET` | `/api/scenarios/{id}` | 回看某个方案（输入快照 + 求解结果） |
 | `DELETE` | `/api/scenarios/{id}` | 删除 |
+| `POST` | `/api/scenarios/{id}/batches` | 从可行方案创建执行批次（冻结快照/阈值/计划） |
+| `GET` | `/api/batches?scenario_id=` | 批次列表（可按场景过滤） |
+| `GET` | `/api/batches/{id}` | 批次详情（冻结计划 + 全部上报） |
+| `DELETE` | `/api/batches/{id}` | 删除批次及其上报 |
+| `PUT` | `/api/batches/{id}/reports` | 上报某架次实际起飞偏移与修订号（幂等/冲突） |
+| `GET` | `/api/batches/{id}/warning?t=` | 在非负当前秒 `t` 评估偏差预警 |
 | `GET` | `/api/health` | 健康检查 |
 
 命令行示例：
@@ -197,6 +218,182 @@ curl -X POST http://localhost:8000/api/import \
 
 ---
 
+## 执行批次 / 偏差预警：可复现演练
+
+下面所有请求/响应均由本仓库 `examples/crossroads.json` 在 `t` 评估时实跑得到
+（`created_at`、`reported_at` 为时间戳，每次运行会不同；冲突数值由连续时间几何
+确定，稳定可复现）。先 `docker compose up` 启动服务。
+
+### 1) 导入 → 求解 → 保存 → 建批次
+
+```bash
+# 导入
+curl -s -X POST http://localhost:8000/api/import \
+  -H 'Content-Type: application/json' \
+  --data @examples/crossroads.json
+# => {"scenario_id":1, ...}
+
+# 求解（得到唯一字典序最优计划偏移）
+curl -s -X POST http://localhost:8000/api/scenarios/1/solve \
+  -H 'Content-Type: application/json' -d '{"time_limit":20}'
+# => solution: {"feasible":true,"status":"optimal","weighted_delay":28,
+#              "offsets":{"UAV-A":4,"UAV-B":0,"UAV-C":2,"UAV-D":6}}
+
+# 保存
+curl -s -X POST http://localhost:8000/api/scenarios/1/save \
+  -H 'Content-Type: application/json' -d '{"name":"crossroads-plan"}'
+# => {"scenario_id":1,"name":"crossroads-plan","saved":true}
+
+# 从可行方案创建执行批次（冻结输入航迹 / 安全阈值 / 计划偏移）
+curl -s -X POST http://localhost:8000/api/scenarios/1/batches \
+  -H 'Content-Type: application/json' -d '{"name":"演练批次-1"}'
+```
+
+响应：
+
+```json
+{"batch_id":1,"scenario_id":1,"name":"演练批次-1",
+ "safety_radius":30.0,"safety_height":10.0,
+ "planned_offsets":{"UAV-A":4,"UAV-B":0,"UAV-C":2,"UAV-D":6},"reports":[]}
+```
+
+对场景 1 再做带锁定的重算（`locks=[{"sortie_id":"UAV-B","offset":5}]`）会得到新的
+计划偏移 `{"UAV-A":4,"UAV-B":5,"UAV-C":10,"UAV-D":11}`，但批次 1 的
+`planned_offsets` 仍是 `{4,0,2,6}`——**原方案重算不改变批次**。
+
+### 2) 上报实际起飞（修订协议）
+
+```bash
+# 首版修订号必须为 1：UAV-A 实际晚 3 秒起飞（实际偏移 7）
+curl -s -X PUT http://localhost:8000/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":7,"revision":1}'
+# => {"batch_id":1,"report":{"sortie_id":"UAV-A","actual_offset":7,"revision":1},
+#     "accepted":true,"idempotent":false}
+
+# 同号同值重试：幂等
+curl -s -X PUT http://localhost:8000/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":7,"revision":1}'
+# => ... "accepted":true,"idempotent":true
+
+# 同号异值：409 冲突
+curl -i -X PUT http://localhost:8000/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":8,"revision":1}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"reason":"revision_value_conflict","sortie_id":"UAV-A","revision":1,
+#            "stored_actual_offset":7,"received_actual_offset":8}}
+```
+
+纠错（更高修订号）与旧号冲突：
+
+```bash
+# 修订号 2 纠正为实际偏移 4（回到计划）
+curl -s -X PUT http://localhost:8000/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":4,"revision":2}'
+# => ... "report":{"sortie_id":"UAV-A","actual_offset":4,"revision":2}
+
+# 再发旧修订号：409
+curl -i -X PUT http://localhost:8000/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":4,"revision":1}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"reason":"stale_revision","sortie_id":"UAV-A",
+#            "received_revision":1,"current_revision":2}}
+```
+
+约束：`actual_offset`、`revision` 为整数，`actual_offset >= 0`、`revision >= 1`，
+否则 `422`；未知批次/架次返回 `404`。并发对同一架次以不同修订号上报时，存储层
+在同一把锁内做比较并写入，最终**只保留最高修订号**那一条。
+
+### 3) 评估预警（含拒绝、逾期、不完整标记）
+
+当前秒 `t` 早于任一已上报实际起飞时刻则拒绝（`t` 本身要求非负整数，否则 `400/422`）：
+
+```bash
+curl -i "http://localhost:8000/api/batches/1/warning?t=0"
+# HTTP/1.1 400 Bad Request
+# {"detail":{"reason":"t_before_reported_takeoff","t":0,
+#            "violations":[{"sortie_id":"UAV-A","actual_takeoff":4}]}}
+```
+
+未上报且计划起飞已严格早于 `t` 的架次被判**逾期**、排除预测，并标记预测不完整
+（全新批次，计划为 A=4/B=0/C=2/D=6，`t=3`）：
+
+```bash
+curl -s "http://localhost:8000/api/batches/3/warning?t=3"
+```
+
+```json
+{"t":3,"complete":false,"incomplete":true,
+ "overdue_sorties":["UAV-B","UAV-C"],
+ "sorties":[
+   {"id":"UAV-A","status":"planned","planned_offset":4,"actual_offset":null,
+    "revision":null,"takeoff_offset":4,"deviation_seconds":null},
+   {"id":"UAV-B","status":"overdue","planned_offset":0,"actual_offset":null,
+    "revision":null,"takeoff_offset":null,"deviation_seconds":null},
+   {"id":"UAV-C","status":"overdue", "...": "..."},
+   {"id":"UAV-D","status":"planned","planned_offset":6,"takeoff_offset":6, "...": "..."}],
+ "conflicts":[],"first_conflict_time":null,"reported_deviations":[]}
+```
+
+### 4) 偏差引发的连续时间冲突预警
+
+新建批次并上报：A 实际 4（计划 4）、**B 实际 4（计划 0，偏离 +4 秒）**、
+C 实际 2（计划 2）；D 未上报。在 `t=4`（D 的计划起飞 6 不早于 4，故按计划预测）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/scenarios/1/batches \
+  -H 'Content-Type: application/json' -d '{"name":"演练批次-2（含偏差）"}'
+# 批次 id=2
+curl -s -X PUT http://localhost:8000/api/batches/2/reports -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":4,"revision":1}'
+curl -s -X PUT http://localhost:8000/api/batches/2/reports -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-B","actual_offset":4,"revision":1}'
+curl -s -X PUT http://localhost:8000/api/batches/2/reports -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-C","actual_offset":2,"revision":1}'
+curl -s "http://localhost:8000/api/batches/2/warning?t=4"
+```
+
+响应（节选）：
+
+```json
+{"t":4,"complete":true,"incomplete":false,"overdue_sorties":[],
+ "first_conflict_time":9.942324,
+ "sorties":[
+   {"id":"UAV-A","status":"reported","planned_offset":4,"actual_offset":4,
+    "revision":1,"takeoff_offset":4,"deviation_seconds":0},
+   {"id":"UAV-B","status":"reported","planned_offset":0,"actual_offset":4,
+    "revision":1,"takeoff_offset":4,"deviation_seconds":4},
+   {"id":"UAV-C","status":"reported","planned_offset":2,"actual_offset":2,
+    "revision":1,"takeoff_offset":2,"deviation_seconds":0},
+   {"id":"UAV-D","status":"planned","planned_offset":6,"actual_offset":null,
+    "revision":null,"takeoff_offset":6,"deviation_seconds":null}],
+ "conflicts":[
+   {"sortie_a":"UAV-B","sortie_b":"UAV-C",
+    "time_start":9.942324,"time_end":12.519215,"witness_time":11.230769,
+    "a_pos":[120.0,12.307692,22.0],"b_pos":[110.769231,6.153846,24.0],
+    "horizontal_distance":11.094004,"vertical_distance":2.0},
+   {"sortie_a":"UAV-B","sortie_b":"UAV-D",
+    "time_start":12.335899,"time_end":15.664101,"witness_time":14.0,
+    "a_pos":[120.0,40.0,22.0],"b_pos":[120.0,40.0,18.0],
+    "horizontal_distance":0.0,"vertical_distance":4.0}],
+ "reported_deviations":[
+   {"sortie_id":"UAV-A","planned_offset":4,"actual_offset":4,"revision":1,"deviation_seconds":0},
+   {"sortie_id":"UAV-B","planned_offset":0,"actual_offset":4,"revision":1,"deviation_seconds":4},
+   {"sortie_id":"UAV-C","planned_offset":2,"actual_offset":2,"revision":1,"deviation_seconds":0}]}
+```
+
+冲突只取 `t=4` 及之后的连续时间区间；当 `t` 落在某区间内部时，`time_start` 会被
+裁剪到 `t`、`witness_time` 与见证位置相应重算，`first_conflict_time` 同步为裁剪后
+的起点；区间整体早于 `t` 时不再返回。**纠错后重算**（对 B 再发更高修订号）或
+**批次重载**（`GET /api/batches/2` 后重新 `warning`）结果完全一致——预警是冻结
+批次与已存上报的纯函数。
+
+---
+
 ## 测试
 
 测试不依赖容器，在本地虚拟环境中运行：
@@ -205,12 +402,16 @@ curl -X POST http://localhost:8000/api/import \
 pip install -r requirements.txt
 python tests/test_geometry_crossval.py     # 几何：解析法 vs 连续扫描 vs 密采样
 python tests/test_solver_bruteforce.py 2026  # 求解器：对照暴力枚举（含无解核极小性）
+python tests/test_batches_warning.py       # 批次：修订协议/并发最高号/预警分类与冲突
 ```
 
 - `test_geometry_crossval.py` 用三套相互独立的实现（多边形/椭圆柱解析、
   连续时间区间剖分、密采样神谕）对上千个随机航段对与擦边案例做一致性校验；
 - `test_solver_bruteforce.py` 在小窗口下穷举所有起飞组合，验证最优目标、
-  字典序择优、锁定约束以及无解核的可行性与包含极小性。
+  字典序择优、锁定约束以及无解核的可行性与包含极小性；
+- `test_batches_warning.py` 验证批次冻结、首版为 1/严格递增/幂等/冲突/并发只留
+  最高修订号，以及预警的拒绝、已上报/按计划/逾期分类、不完整标记、连续时间冲突
+  区间向 `t` 投影与“重载结果一致”。
 
 ---
 
@@ -222,3 +423,9 @@ python tests/test_solver_bruteforce.py 2026  # 求解器：对照暴力枚举（
   冲突检测本身在连续时间上进行。
 - 求解时限可在页面或请求中设置（默认 20 秒）。正常规模下加权延误优化通常
   很快即可得到 `optimal`；超时会返回当前最优 `feasible` 并在状态中标明。
+- 执行批次只允许从**可行方案**创建；批次保存的是独立的输入/阈值/计划快照，
+  场景的后续重算、改名或删除不影响已建批次的预警计算（删除场景会级联移除其
+  批次，依赖 SQLite 外键 `ON DELETE`）。
+- 预警的“计划起飞不早于 `t`”按 `计划偏移 >= t` 判定（恰在 `t` 起飞仍可预测）；
+  逾期架次不参与任何冲突对，因此只要存在逾期架次 `incomplete=true`。已上报架次
+  的偏离秒数 = 实际偏移 − 计划偏移（负为提前、正为延误）。

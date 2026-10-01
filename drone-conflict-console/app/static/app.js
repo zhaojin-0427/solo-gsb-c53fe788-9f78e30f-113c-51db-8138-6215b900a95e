@@ -18,6 +18,10 @@ const state = {
   time: 0,
   maxTime: 1,
   colorsById: {},
+  batches: [],
+  batch: null,           // currently open batch summary + warning
+  warning: null,
+  warningSorties: {},    // latest warning rows keyed by sortie id
 };
 
 const $ = (id) => document.getElementById(id);
@@ -73,16 +77,21 @@ function loadScenarioDto(dto) {
   state.solution = dto.solution || null;
   state.locks = {};
   state.colorsById = {};
+  state.batch = null;
+  state.warning = null;
+  state.warningSorties = {};
   state.sorties.forEach((s) => colorFor(s.id));
   $("safetyRadius").value = dto.safety_radius;
   $("safetyHeight").value = dto.safety_height;
   $("newSolveBtn").disabled = false;
+  $("createBatchBtn").disabled = !(state.solution && state.solution.feasible);
   $("savePlanBtn").disabled = !(state.solution && state.solution.feasible);
   updateMaxTime();
   state.time = 0;
   $("timeScrub").value = 0;
   renderResultPanel();
   renderSortiePanel();
+  fetchBatches();
 }
 
 async function fetchHistory() {
@@ -630,6 +639,223 @@ function escapeHtml(t) {
 }
 
 // ---------------------------------------------------------------------------
+// Execution batches & deviation early-warning
+// ---------------------------------------------------------------------------
+
+async function fetchBatches() {
+  if (!state.scenarioId) return;
+  const d = await api(`/api/batches?scenario_id=${state.scenarioId}`);
+  state.batches = d.batches;
+  renderBatchList();
+}
+
+function reportMap(batch) {
+  const m = {};
+  for (const r of batch.reports || []) m[r.sortie_id] = r;
+  return m;
+}
+
+function nextRevision(sortieId) {
+  const m = reportMap(state.batch || { reports: [] });
+  const cur = m[sortieId];
+  return cur ? cur.revision + 1 : 1;
+}
+
+async function createBatch() {
+  if (!state.scenarioId) return;
+  const name = prompt("为执行批次命名（可留空）：", `批次 #${state.scenarioId}`);
+  if (name === null) return;
+  try {
+    const b = await api(`/api/scenarios/${state.scenarioId}/batches`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    toast("已创建执行批次（输入航迹 / 安全阈值 / 计划偏移已冻结）");
+    await fetchBatches();
+    await openBatch(b.batch_id);
+  } catch (e) {
+    toast("创建批次失败：" + e.message, 4000);
+  }
+}
+
+async function openBatch(bid) {
+  try {
+    const b = await api(`/api/batches/${bid}`);
+    // The page and HTTP API share the same batch rows; make sure the view is
+    // looking at the scenario the batch was frozen from.
+    if (!state.scenarioId || state.scenarioId !== b.scenario_id) {
+      const dto = await api(`/api/scenarios/${b.scenario_id}`);
+      loadScenarioDto(dto);
+      renderAll();
+    }
+    state.batch = b;
+    state.warning = null;
+    state.warningSorties = {};
+    renderBatchList();
+    renderBatchDetail();
+  } catch (e) {
+    toast("载入批次失败：" + e.message);
+  }
+}
+
+async function deleteBatch(bid) {
+  if (!confirm("删除该执行批次及其全部上报？")) return;
+  await api(`/api/batches/${bid}`, { method: "DELETE" });
+  if (state.batch && state.batch.batch_id === bid) {
+    state.batch = null;
+    state.warning = null;
+    state.warningSorties = {};
+  }
+  toast("批次已删除");
+  await fetchBatches();
+  renderBatchDetail();
+}
+
+async function submitReport(sortieId) {
+  const offEl = document.querySelector(`[data-off="${sortieId}"]`);
+  const actual = parseInt(offEl.value, 10);
+  if (!Number.isInteger(actual) || actual < 0) {
+    toast("实际起飞偏移必须是非负整数秒");
+    return;
+  }
+  const revision = nextRevision(sortieId);
+  const t = parseInt($("warnT").value, 10);
+  try {
+    const r = await api(`/api/batches/${state.batch.batch_id}/reports`, {
+      method: "PUT",
+      body: JSON.stringify({ sortie_id: sortieId, actual_offset: actual, revision }),
+    });
+    toast(r.idempotent ? "重复上报（幂等），内容未变" : `已接受修订号 ${revision}`);
+    await openBatch(state.batch.batch_id);
+    if (Number.isInteger(t) && t >= 0) {
+      $("warnT").value = t;
+      await evaluateWarning();
+    }
+  } catch (e) {
+    toast(`上报冲突：${e.message}`, 4200);
+  }
+}
+
+async function evaluateWarning() {
+  const t = parseInt($("warnT").value, 10);
+  if (!Number.isInteger(t) || t < 0) {
+    toast("t 必须是非负整数秒");
+    return;
+  }
+  try {
+    const d = await api(`/api/batches/${state.batch.batch_id}/warning?t=${t}`);
+    state.batch = d;
+    state.warning = d.warning;
+    state.warningSorties = {};
+    for (const row of d.warning.sorties) state.warningSorties[row.id] = row;
+    renderBatchDetail();
+  } catch (e) {
+    state.warning = null;
+    renderBatchDetail();
+    toast("评估被拒绝：" + e.message, 4200);
+  }
+}
+
+function renderBatchList() {
+  const box = $("batchList");
+  box.innerHTML = "";
+  if (!state.batches.length) {
+    box.innerHTML = `<div class="hint">尚无执行批次。</div>`;
+    return;
+  }
+  for (const b of state.batches) {
+    const div = document.createElement("div");
+    div.className = "history-item batch-item" +
+      (state.batch && state.batch.batch_id === b.id ? " active" : "");
+    div.innerHTML = `<span>#${b.id} ${escapeHtml(b.name || "未命名批次")}（已上报 ${b.reported_count}）</span>
+      <span class="h-del" title="删除批次">🗑</span>`;
+    div.addEventListener("click", (e) => {
+      if (e.target.classList.contains("h-del")) { deleteBatch(b.id); return; }
+      openBatch(b.id);
+    });
+    box.appendChild(div);
+  }
+}
+
+function statusLabel(status) {
+  return { reported: "已上报", planned: "按计划", overdue: "逾期" }[status] || status;
+}
+
+function devClass(v) {
+  if (v === null || v === undefined) return "";
+  return v > 0 ? "pos" : v < 0 ? "neg" : "zero";
+}
+
+function renderBatchDetail() {
+  const detail = $("batchDetail");
+  if (!state.batch) {
+    detail.classList.add("hidden");
+    return;
+  }
+  detail.classList.remove("hidden");
+  const b = state.batch;
+  $("batchTitle").textContent = `批次 #${b.batch_id}${b.name ? " · " + b.name : ""}`;
+  const plan = Object.keys(b.planned_offsets).sort()
+    .map((k) => `${escapeHtml(k)}=${b.planned_offsets[k]}`).join("，");
+  $("batchPlan").textContent = `计划偏移（秒）：${plan}；安全 R=${b.safety_radius}m / H=${b.safety_height}m`;
+
+  const reports = reportMap(b);
+  const box = $("warnSorties");
+  box.innerHTML = "";
+  for (const s of state.sorties) {
+    const rep = reports[s.id];
+    const wrow = state.warningSorties[s.id];
+    const planned = b.planned_offsets[s.id];
+    const dev = rep ? rep.actual_offset - planned : null;
+    const status = wrow ? wrow.status : "planned";
+    const div = document.createElement("div");
+    div.className = "warn-sortie";
+    div.innerHTML = `
+      <div class="ws-top">
+        <span class="swatch" style="background:${colorFor(s.id)}"></span>
+        <span class="ws-id">${escapeHtml(s.id)}</span>
+        <span class="ws-tag ${status}">${statusLabel(status)}</span>
+        <span class="ws-meta">计划 ${planned}s${rep ? ` · 实际 ${rep.actual_offset}s · 修订 ${rep.revision}` : ""}</span>
+      </div>
+      <div class="ws-dev">
+        <input type="number" min="0" step="1" value="${rep ? rep.actual_offset : 0}" data-off="${s.id}" />
+        <button data-report="${s.id}">上报（修订号 ${nextRevision(s.id)}）</button>
+        <span class="dev-val ${devClass(dev)}">${rep
+          ? `偏离计划 ${dev > 0 ? "+" : ""}${dev}s` : "未上报"}</span>
+      </div>`;
+    box.appendChild(div);
+  }
+  box.querySelectorAll("[data-report]").forEach((btn) => {
+    btn.addEventListener("click", () => submitReport(btn.getAttribute("data-report")));
+  });
+
+  const sum = $("warnSummary");
+  const cf = $("warnConflicts");
+  if (!state.warning) {
+    sum.innerHTML = `<div class="hint">设置当前秒 t 后点“评估预警”。</div>`;
+    cf.innerHTML = "";
+    return;
+  }
+  const w = state.warning;
+  sum.innerHTML = `
+    <div class="${w.incomplete ? "bad" : "ok"}">
+      ${w.incomplete ? `⚠️ 预测不完整：${w.overdue_sorties.map(escapeHtml).join("、")} 已逾期并排除`
+                      : "✅ 预测完整（全部架次可预测）"}
+    </div>
+    <div class="hint">首个冲突时刻：${w.first_conflict_time === null ? "无" : w.first_conflict_time + " s"}；
+      已上报偏离：${w.reported_deviations.length
+        ? w.reported_deviations.map((d) => `${escapeHtml(d.sortie_id)} ${d.deviation_seconds > 0 ? "+" : ""}${d.deviation_seconds}s`).join("，")
+        : "无"}</div>`;
+  if (!w.conflicts.length) {
+    cf.innerHTML = `<div class="wc-none">t = ${w.t} s 及之后无冲突区间。</div>`;
+  } else {
+    cf.innerHTML = `<div class="wc-title">冲突区间（连续时间，≥ t=${w.t}s）</div>` +
+      w.conflicts.map((x) => `<div class="wc-line">${escapeHtml(x.sortie_a)} ↔ ${escapeHtml(x.sortie_b)}：
+        [${x.time_start}, ${x.time_end}] s（见证 ${x.witness_time} s）</div>`).join("");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -672,6 +898,13 @@ $("savePlanBtn").addEventListener("click", async () => {
 });
 
 $("closeResult").addEventListener("click", () => $("resultPanel").classList.add("hidden"));
+
+$("createBatchBtn").addEventListener("click", createBatch);
+$("evalWarnBtn").addEventListener("click", evaluateWarning);
+$("warnT").addEventListener("keydown", (e) => { if (e.key === "Enter") evaluateWarning(); });
+$("batchDel").addEventListener("click", () => {
+  if (state.batch) deleteBatch(state.batch.batch_id);
+});
 
 $("timeScrub").addEventListener("input", (e) => {
   state.time = (parseFloat(e.target.value) / 100) * state.maxTime;

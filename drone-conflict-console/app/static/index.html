@@ -60,6 +60,34 @@
       <h3>已保存方案</h3>
       <div id="historyList" class="history-list"></div>
     </section>
+
+    <section class="card" id="batchCard">
+      <h3>执行批次与偏差预警</h3>
+      <div class="hint">从当前可行方案创建执行批次：冻结输入航迹、安全阈值与计划偏移；之后对原方案重算不会改变批次。</div>
+      <div class="row" style="margin-bottom:8px">
+        <button id="createBatchBtn" disabled>从当前方案创建执行批次</button>
+      </div>
+      <div id="batchList" class="history-list"></div>
+
+      <div id="batchDetail" class="hidden" style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
+        <div class="bd-head">
+          <span id="batchTitle" class="bd-title"></span>
+          <span id="batchDel" class="h-del" title="删除批次">🗑</span>
+        </div>
+        <div class="hint" id="batchPlan"></div>
+
+        <div class="row" style="margin:8px 0 6px">
+          <label>当前秒 t（非负整数）</label>
+          <div class="t-row">
+            <input id="warnT" type="number" min="0" step="1" value="0" />
+            <button id="evalWarnBtn">评估预警</button>
+          </div>
+        </div>
+        <div id="warnSummary" class="warn-summary"></div>
+        <div id="warnSorties" class="warn-sorties"></div>
+        <div id="warnConflicts" class="warn-conflicts"></div>
+      </div>
+    </section>
   </aside>
 
   <section class="content">
