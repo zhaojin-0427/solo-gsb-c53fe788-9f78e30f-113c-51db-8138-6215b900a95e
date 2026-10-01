@@ -70,3 +70,17 @@ class SolveRequest(BaseModel):
 
 class SaveRequest(BaseModel):
     name: str = Field(..., min_length=1)
+
+
+class BatchCreateRequest(BaseModel):
+    name: str = Field("", min_length=0, max_length=200)
+
+
+class BatchReportItem(BaseModel):
+    sortie_id: str = Field(..., min_length=1)
+    actual_offset: int = Field(..., ge=0)
+    revision: int = Field(..., ge=1)
+
+
+class BatchReportRequest(BaseModel):
+    reports: list[BatchReportItem] = Field(..., min_length=1)

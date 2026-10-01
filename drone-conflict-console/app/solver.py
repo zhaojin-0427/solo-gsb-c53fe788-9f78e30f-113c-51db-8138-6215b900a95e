@@ -104,21 +104,59 @@ def build_pair_constraints(sorties, safety_radius: float, safety_height: float) 
 
 
 def scan_schedule(sorties, offsets: dict[str, int], safety_radius: float,
-                  safety_height: float) -> list[dict]:
+                  safety_height: float, not_before: float | None = None) -> list[dict]:
     records: list[dict] = []
     for i in range(len(sorties)):
         sa = sorties[i]
+        if sa.id not in offsets:
+            continue
         for j in range(i + 1, len(sorties)):
             sb = sorties[j]
+            if sb.id not in offsets:
+                continue
             recs = conflicts_between_sorties(
-                sa, offsets.get(sa.id, 0),
-                sb, offsets.get(sb.id, 0),
+                sa, offsets[sa.id],
+                sb, offsets[sb.id],
                 safety_radius, safety_height,
             )
             for r in recs:
-                records.append(_record_to_dict(r))
+                d = _record_to_dict(r)
+                if not_before is not None:
+                    d = _clip_conflict_dict(d, not_before, sa, sb, offsets)
+                    if d is None:
+                        continue
+                records.append(d)
     records.sort(key=lambda r: (r["time_start"], r["sortie_a"], r["sortie_b"]))
     return records
+
+
+def _clip_conflict_dict(record: dict, t: float, sa, sb, offsets: dict[str, int]) -> dict | None:
+    """Clip one conflict record to global time >= t and refresh witness data."""
+    if record["time_end"] < t - 1e-7:
+        return None
+    if record["time_start"] >= t - 1e-7:
+        return record
+
+    start = max(float(record["time_start"]), float(t))
+    end = float(record["time_end"])
+    witness = max(start, min(float(record["witness_time"]), end))
+    if end - start < 1e-9:
+        witness = start
+
+    pa = sa.position(witness - offsets[sa.id])
+    pb = sb.position(witness - offsets[sb.id])
+    clipped = dict(record)
+    clipped.update({
+        "time_start": round(start, 6),
+        "time_end": round(end, 6),
+        "witness_time": round(witness, 6),
+        "a_pos": [round(v, 6) for v in pa],
+        "b_pos": [round(v, 6) for v in pb],
+        "horizontal_distance": round(
+            ((pa[0] - pb[0]) ** 2 + (pa[1] - pb[1]) ** 2) ** 0.5, 6),
+        "vertical_distance": round(abs(pa[2] - pb[2]), 6),
+    })
+    return clipped
 
 
 def _record_to_dict(r) -> dict:

@@ -99,13 +99,29 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .si-body .locked-tag { color: var(--warn); }
 
 .history-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow: auto; }
+.subhead { margin: 10px 0 6px; font-size: 12px; color: var(--muted); }
+.subhead:first-child { margin-top: 0; }
 .history-item {
   display: flex; align-items: center; justify-content: space-between;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
   padding: 7px 9px; cursor: pointer; font-size: 12px;
 }
 .history-item:hover { border-color: var(--accent); }
+.history-item.active { border-color: var(--accent); background: #20304d; }
 .history-item .h-del { color: var(--bad); cursor: pointer; padding: 0 4px; }
+
+.batch-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+.batch-head span { color: var(--muted); }
+.batch-form { display: grid; grid-template-columns: 1fr 74px 62px auto; gap: 6px; align-items: center; margin: 8px 0; }
+.batch-form label { color: var(--muted); font-size: 12px; }
+.batch-form input, .batch-form select {
+  min-width: 0; background: #0e1525; color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 6px;
+}
+.warning-summary { background: var(--panel2); border-radius: 8px; padding: 8px; margin-top: 8px; }
+.badge { border-radius: 999px; padding: 2px 8px; font-size: 11px; }
+.badge.ok { background: rgba(56,211,159,.18); color: var(--ok); }
+.badge.bad { background: rgba(255,93,108,.18); color: var(--bad); }
 
 canvas {
   width: 100%;

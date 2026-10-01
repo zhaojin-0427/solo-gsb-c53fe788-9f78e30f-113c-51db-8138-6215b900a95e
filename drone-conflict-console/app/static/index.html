@@ -16,6 +16,7 @@
     </label>
     <button id="loadExampleBtn">载入示例</button>
     <button id="savePlanBtn" disabled>保存当前方案</button>
+    <button id="createBatchBtn" disabled>从可行方案创建批次</button>
     <button id="newSolveBtn" disabled>重算（应用锁定）</button>
   </div>
 </header>
@@ -51,13 +52,21 @@
     </section>
 
     <section class="card" id="sortiesCard">
-      <h3>架次与锁定</h3>
-      <div class="hint">勾选“锁定”并填写整数秒偏移，再点“重算”。</div>
+      <h3 id="sortiesTitle">架次与锁定</h3>
+      <div class="hint" id="sortiesHint">勾选“锁定”并填写整数秒偏移，再点“重算”。</div>
       <div id="sortiesList" class="sorties-list"></div>
     </section>
 
+    <section class="card hidden" id="batchCard">
+      <h3>执行偏差预警</h3>
+      <div id="batchBody"></div>
+    </section>
+
     <section class="card" id="historyCard">
-      <h3>已保存方案</h3>
+      <h3>执行批次 / 已保存方案</h3>
+      <h4 class="subhead">执行批次</h4>
+      <div id="batchList" class="history-list"></div>
+      <h4 class="subhead">已保存方案</h4>
       <div id="historyList" class="history-list"></div>
     </section>
   </aside>

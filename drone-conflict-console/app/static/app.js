@@ -14,6 +14,10 @@ const state = {
   earliestConflicts: [],
   solution: null,
   history: [],
+  batchList: [],
+  activeBatch: null,
+  activeWarning: null,
+  activeWarningT: 0,
   locks: {},             // sortieId -> offset (only when checked)
   time: 0,
   maxTime: 1,
@@ -71,6 +75,8 @@ function loadScenarioDto(dto) {
   state.pairConstraints = dto.pair_constraints || [];
   state.earliestConflicts = dto.earliest_conflicts || [];
   state.solution = dto.solution || null;
+  state.activeBatch = null;
+  state.activeWarning = null;
   state.locks = {};
   state.colorsById = {};
   state.sorties.forEach((s) => colorFor(s.id));
@@ -78,6 +84,9 @@ function loadScenarioDto(dto) {
   $("safetyHeight").value = dto.safety_height;
   $("newSolveBtn").disabled = false;
   $("savePlanBtn").disabled = !(state.solution && state.solution.feasible);
+  $("createBatchBtn").disabled = !(state.solution && state.solution.feasible);
+  $("sortiesTitle").textContent = "架次与锁定";
+  $("sortiesHint").textContent = "勾选“锁定”并填写整数秒偏移，再点“重算”。";
   updateMaxTime();
   state.time = 0;
   $("timeScrub").value = 0;
@@ -90,6 +99,125 @@ async function fetchHistory() {
   state.history = d.scenarios;
   renderHistory();
   return state.history;
+}
+
+async function fetchBatches() {
+  const d = await api("/api/batches");
+  state.batchList = d.batches || [];
+  renderBatchList();
+  return state.batchList;
+}
+
+async function createBatch() {
+  if (!state.scenarioId) return;
+  try {
+    const dto = await api(`/api/scenarios/${state.scenarioId}/batches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "" }),
+    });
+    await fetchBatches();
+    await openBatch(dto.batch_id, 0);
+    toast(`已创建并冻结执行批次 #${dto.batch_id}`);
+  } catch (e) {
+    toast("创建批次失败：" + e.message, 4200);
+  }
+}
+
+async function openBatch(bid, warningT = null) {
+  try {
+    const path = warningT === null
+      ? `/api/batches/${bid}`
+      : `/api/batches/${bid}?t=${encodeURIComponent(warningT)}`;
+    const dto = await api(path);
+    applyBatchDto(dto, warningT);
+    renderAll();
+    renderBatchPanel();
+  } catch (e) {
+    toast("载入批次失败：" + e.message, 4200);
+  }
+}
+
+function applyBatchDto(dto, warningT = null) {
+  state.activeBatch = dto;
+  state.activeWarning = dto.warning || null;
+  state.activeWarningT = warningT ?? 0;
+  state.scenario = dto;
+  state.scenarioId = dto.source_scenario_id;
+  state.sorties = dto.sorties;
+  state.pairConstraints = [];
+  state.earliestConflicts = dto.warning?.conflicts || [];
+  state.solution = dto.solution || {
+    feasible: true,
+    offsets: dto.planned_offsets,
+    status: "frozen",
+    weighted_delay: null,
+    solved_conflicts: [],
+    elapsed_seconds: null,
+    cores: [],
+  };
+  state.locks = {};
+  state.colorsById = {};
+  state.sorties.forEach((s) => colorFor(s.id));
+  $("safetyRadius").value = dto.safety_radius;
+  $("safetyHeight").value = dto.safety_height;
+  $("newSolveBtn").disabled = true;
+  $("savePlanBtn").disabled = true;
+  $("createBatchBtn").disabled = true;
+  $("sortiesTitle").textContent = "架次执行状态";
+  $("sortiesHint").textContent = "已上报架次按实际起飞；未逾期架次按计划；逾期架次排除。";
+  updateMaxTime();
+  state.time = state.activeWarningT;
+  $("timeScrub").value = Math.round((state.activeWarningT / state.maxTime) * 100);
+  renderResultPanel();
+  renderSortiePanel();
+}
+
+async function submitBatchReport(form) {
+  const bid = state.activeBatch?.batch_id;
+  if (!bid) return;
+  const sortie_id = form.querySelector("[data-report-sortie]").value;
+  const actual_offset = parseInt(form.querySelector("[data-report-offset]").value, 10);
+  const revision = parseInt(form.querySelector("[data-report-revision]").value, 10);
+  if (!Number.isInteger(actual_offset) || actual_offset < 0) {
+    toast("实际起飞偏移必须是非负整数秒");
+    return;
+  }
+  if (!Number.isInteger(revision) || revision < 1) {
+    toast("修订号必须是不小于 1 的整数");
+    return;
+  }
+  try {
+    const dto = await api(`/api/batches/${bid}/reports`, {
+      method: "POST",
+      body: JSON.stringify({ reports: [{ sortie_id, actual_offset, revision }] }),
+    });
+    applyBatchDto(dto.batch, null);
+    await fetchBatches();
+    renderAll();
+    renderBatchPanel();
+    toast("实际上报已接收");
+  } catch (e) {
+    toast("上报冲突：" + e.message, 4200);
+  }
+}
+
+async function evaluateBatchWarning() {
+  const bid = state.activeBatch?.batch_id;
+  const t = parseInt($("warningTime").value, 10);
+  if (!bid || !Number.isInteger(t) || t < 0) {
+    toast("当前秒 t 必须是非负整数");
+    return;
+  }
+  try {
+    const dto = await api(`/api/batches/${bid}?t=${encodeURIComponent(t)}`);
+    applyBatchDto(dto, t);
+    renderAll();
+    renderBatchPanel();
+    const w = dto.warning;
+    toast(w.first_conflict_time === null ? "预测无冲突" : `首个冲突：${w.first_conflict_time}s`, 3200);
+  } catch (e) {
+    toast("预警失败：" + e.message, 4200);
+  }
 }
 
 async function solve(extraLocks) {
@@ -161,10 +289,20 @@ function updateMaxTime() {
   state.maxTime = Math.max(1, Math.ceil(m));
 }
 
+function displayOffset(s) {
+  if (state.activeWarning) {
+    const item = state.activeWarning.sorties.find((x) => x.sortie_id === s.id);
+    if (item && item.used_offset !== null && item.used_offset !== undefined) return item.used_offset;
+    return null;
+  }
+  return state.solution && state.solution.feasible ? (state.solution.offsets[s.id] ?? 0) : 0;
+}
+
 function currentOffsets() {
   const o = {};
   for (const s of state.sorties) {
-    o[s.id] = state.solution && state.solution.feasible ? (state.solution.offsets[s.id] ?? 0) : 0;
+    const off = displayOffset(s);
+    if (off !== null) o[s.id] = off;
   }
   return o;
 }
@@ -177,27 +315,49 @@ function renderSortiePanel() {
   const box = $("sortiesList");
   box.innerHTML = "";
   const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const warningItems = state.activeWarning
+    ? Object.fromEntries(state.activeWarning.sorties.map((s) => [s.sortie_id, s]))
+    : {};
   for (const s of state.sorties) {
     const c = colorFor(s.id);
     const div = document.createElement("div");
     div.className = "sortie-item";
     const locked = s.id in state.locks;
     const lockVal = state.locks[s.id] ?? 0;
-    div.innerHTML = `
-      <div class="si-head">
-        <span class="swatch" style="background:${c}"></span>
-        <span class="si-name">${escapeHtml(s.id)}</span>
-        <span class="si-meta">w=${s.weight} · 窗[0,${s.window_hi}] · 长${s.flight_end}s</span>
-      </div>
-      <div class="si-body">
-        <span class="${solvedOff ? "solved-tag" : ""}">求解偏移: <b>${solvedOff ? solvedOff[s.id] : "—"}</b></span>
-        <label class="lock-wrap">
-          <input type="checkbox" ${locked ? "checked" : ""} data-lock-check="${s.id}" />
-          锁定
-          <input type="number" min="0" max="${s.window_hi}" step="1" value="${lockVal}"
-                 data-lock-val="${s.id}" style="${locked ? "" : "opacity:.5"}" />
-        </label>
-      </div>`;
+    const ws = warningItems[s.id];
+    const report = state.activeBatch?.reports?.[s.id];
+    if (state.activeBatch) {
+      const statusText = ws
+        ? `${ws.status === "reported" ? "已上报" : ws.status === "planned" ? "按计划" : "逾期"}`
+        : "未上报";
+      div.innerHTML = `
+        <div class="si-head">
+          <span class="swatch" style="background:${c}"></span>
+          <span class="si-name">${escapeHtml(s.id)}</span>
+          <span class="si-meta">${statusText}${ws ? ` · 使用 ${ws.used_offset ?? "—"}s` : ""}</span>
+        </div>
+        <div class="si-body">
+          <span class="solved-tag">计划: <b>${solvedOff ? solvedOff[s.id] : "—"}</b></span>
+          <span>实际: <b>${report ? report.actual_offset : "—"}</b></span>
+          <span>偏离: <b>${ws && ws.deviation_seconds !== null && ws.deviation_seconds !== undefined ? ws.deviation_seconds : "—"}</b>s</span>
+        </div>`;
+    } else {
+      div.innerHTML = `
+        <div class="si-head">
+          <span class="swatch" style="background:${c}"></span>
+          <span class="si-name">${escapeHtml(s.id)}</span>
+          <span class="si-meta">w=${s.weight} · 窗[0,${s.window_hi}] · 长${s.flight_end}s</span>
+        </div>
+        <div class="si-body">
+          <span class="${solvedOff ? "solved-tag" : ""}">求解偏移: <b>${solvedOff ? solvedOff[s.id] : "—"}</b></span>
+          <label class="lock-wrap">
+            <input type="checkbox" ${locked ? "checked" : ""} data-lock-check="${s.id}" />
+            锁定
+            <input type="number" min="0" max="${s.window_hi}" step="1" value="${lockVal}"
+                   data-lock-val="${s.id}" style="${locked ? "" : "opacity:.5"}" />
+          </label>
+        </div>`;
+    }
     box.appendChild(div);
   }
   box.querySelectorAll("[data-lock-check]").forEach((el) => {
@@ -231,7 +391,7 @@ function renderHistory() {
       <span class="h-del" title="删除">🗑</span>`;
     div.addEventListener("click", async (e) => {
       if (e.target.classList.contains("h-del")) {
-        if (!confirm(`删除场景 #${h.id}？`)) return;
+        if (!confirm(`删除场景 #${h.id}？已冻结批次仍会保留。`)) return;
         await api(`/api/scenarios/${h.id}`, { method: "DELETE" });
         toast("已删除");
         await fetchHistory();
@@ -250,6 +410,89 @@ function renderHistory() {
   }
 }
 
+function renderBatchList() {
+  const box = $("batchList");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!state.batchList.length) {
+    box.innerHTML = `<div class="hint">先打开有可行解的方案，再创建执行批次。</div>`;
+    return;
+  }
+  for (const b of state.batchList) {
+    const div = document.createElement("div");
+    div.className = "history-item" + (state.activeBatch?.batch_id === b.batch_id ? " active" : "");
+    div.innerHTML = `<span title="来源方案 #${b.source_scenario_id ?? "已删除"}">批次 #${b.batch_id} ${escapeHtml(b.name)} · ${b.reported_count}/${b.sortie_count}</span>
+      <span class="h-del" title="删除批次">🗑</span>`;
+    div.addEventListener("click", async (e) => {
+      if (e.target.classList.contains("h-del")) {
+        if (!confirm(`删除执行批次 #${b.batch_id}？上报记录会一并删除。`)) return;
+        await api(`/api/batches/${b.batch_id}`, { method: "DELETE" });
+        if (state.activeBatch?.batch_id === b.batch_id) {
+          state.activeBatch = null;
+          state.activeWarning = null;
+          state.scenario = null;
+        }
+        toast("批次已删除");
+        await fetchBatches();
+        renderAll();
+        return;
+      }
+      await openBatch(b.batch_id, null);
+    });
+    box.appendChild(div);
+  }
+}
+
+function renderBatchPanel() {
+  const card = $("batchCard");
+  if (!card) return;
+  if (!state.activeBatch) {
+    card.classList.add("hidden");
+    return;
+  }
+  card.classList.remove("hidden");
+  const b = state.activeBatch;
+  const w = state.activeWarning;
+  let html = `<div class="batch-head"><b>#${b.batch_id} ${escapeHtml(b.name)}</b>
+    <span>R=${b.safety_radius}, H=${b.safety_height}</span></div>
+    <div class="hint">冻结计划不会因原方案重算而改变。修订号首报为 1，纠错需使用更大的修订号。</div>
+    <form class="batch-form" id="reportForm">
+      <select data-report-sortie>
+        ${b.sorties.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)}</option>`).join("")}
+      </select>
+      <input type="number" min="0" step="1" value="0" data-report-offset title="实际起飞偏移秒" />
+      <input type="number" min="1" step="1" value="1" data-report-revision title="修订号" />
+      <button type="submit">上报</button>
+    </form>
+    <div class="batch-form">
+      <label>当前秒 t</label>
+      <input id="warningTime" type="number" min="0" step="1" value="${state.activeWarningT}" />
+      <button type="button" id="warningBtn">重算预警</button>
+    </div>`;
+
+  if (w) {
+    const status = w.incomplete ? `<span class="badge bad">预测不完整：${w.sorties.filter((s) => s.status === "overdue").length} 架逾期</span>`
+      : `<span class="badge ok">预测完整</span>`;
+    html += `<div class="warning-summary">
+      <div class="kv"><span>t</span><b>${w.t}</b></div>
+      <div class="kv"><span>完整性</span>${status}</div>
+      <div class="kv ${w.first_conflict_time === null ? "ok" : "bad"}">
+        <span>首个冲突时刻</span><b>${w.first_conflict_time === null ? "无" : w.first_conflict_time + " s"}</b>
+      </div>
+      <div class="kv"><span>冲突区间</span><b>${w.conflict_count}</b></div>
+      <div class="hint">已上报偏离：${Object.entries(w.deviations).length
+        ? Object.entries(w.deviations).map(([id, d]) => `${escapeHtml(id)}=${d}s`).join("，")
+        : "暂无"}</div>
+    </div>`;
+  }
+  $("batchBody").innerHTML = html;
+  $("reportForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    submitBatchReport(e.currentTarget);
+  });
+  $("warningBtn").addEventListener("click", evaluateBatchWarning);
+}
+
 // ---------------------------------------------------------------------------
 // Result panel
 // ---------------------------------------------------------------------------
@@ -264,6 +507,26 @@ function renderResultPanel() {
     return;
   }
   panel.classList.remove("hidden");
+  if (state.activeBatch) {
+    title.textContent = "🚨 执行偏差预警（冻结批次）";
+    const w = state.activeWarning;
+    if (!w) {
+      body.innerHTML = `<div class="hint">输入非负当前秒 t，点击“重算预警”。上报实际偏移后可用更高修订号纠错。</div>`;
+    } else {
+      let html = `<div class="kv"><span>当前秒 t</span><b>${w.t}</b></div>
+        <div class="kv ${w.incomplete ? "bad" : "ok"}"><span>预测完整性</span><b>${w.incomplete ? "不完整" : "完整"}</b></div>
+        <div class="kv ${w.first_conflict_time === null ? "ok" : "bad"}">
+          <span>首个冲突时刻</span><b>${w.first_conflict_time === null ? "无" : w.first_conflict_time + " s"}</b>
+        </div>
+        <div class="kv"><span>t 及之后冲突区间</span><b>${w.conflict_count}</b></div>`;
+      for (const cf of w.conflicts.slice(0, 8)) {
+        html += `<div class="mutex-line">${escapeHtml(cf.sortie_a)} ↔ ${escapeHtml(cf.sortie_b)}：[${cf.time_start}, ${cf.time_end}] s</div>`;
+      }
+      if (w.conflicts.length > 8) html += `<div class="hint">其余 ${w.conflicts.length - 8} 个区间见 API 响应。</div>`;
+      body.innerHTML = html;
+    }
+    return;
+  }
   if (!sol.feasible) {
     title.textContent = "⚠️ 无解 — 极小无解架次集合";
     let html = `<div class="kv bad"><span>状态</span><b>${sol.status}</b></div>`;
@@ -437,15 +700,15 @@ function renderMap() {
   const proj = projectors(w, h);
   drawGrid(ctx, w, h, proj);
 
-  const showE = $("showEarliest").checked;
+  const showE = $("showEarliest").checked && !state.activeBatch;
   const showS = $("showSolved").checked;
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
 
   for (const s of state.sorties) {
     if (showE) drawTrack(ctx, proj, s, 0, true, state.time);
   }
   for (const s of state.sorties) {
-    if (showS && solvedOff) drawTrack(ctx, proj, s, solvedOff[s.id] || 0, false, state.time);
+    const off = displayOffset(s);
+    if (showS && off !== null) drawTrack(ctx, proj, s, off, false, state.time);
   }
   drawSafetyRadius(ctx, proj, state.earliestConflicts, state.scenario.safety_radius);
   drawConflictMarkers(ctx, proj, state.earliestConflicts);
@@ -470,7 +733,6 @@ function renderTimeline() {
   ctx.clearRect(0, 0, w, h);
   if (!state.sorties.length) return;
   const g = timelineGeometry(w, h);
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
 
   // grid + axis
   ctx.strokeStyle = "#243049"; ctx.fillStyle = "#8092b5"; ctx.font = "10px monospace";
@@ -490,13 +752,14 @@ function renderTimeline() {
     ctx.fillText(s.id, 8, yc + 4);
 
     // earliest bar (dashed outline)
-    if ($("showEarliest").checked) {
+    if ($("showEarliest").checked && !state.activeBatch) {
       drawBar(ctx, tToX(0, g), yc - barH / 2, tToX(s.flight_end, g) - tToX(0, g), barH,
               colorFor(s.id), true, 0.45);
     }
-    // solved bar
-    if (solvedOff && $("showSolved").checked) {
-      const t0 = solvedOff[s.id] || 0;
+    // effective / solved bar
+    const effectiveOff = displayOffset(s);
+    if ($("showSolved").checked && effectiveOff !== null) {
+      const t0 = effectiveOff;
       drawBar(ctx, tToX(t0, g), yc - barH / 2,
               tToX(t0 + s.flight_end, g) - tToX(t0, g), barH,
               colorFor(s.id), false, 0.92);
@@ -563,14 +826,14 @@ function renderProfile() {
     ctx.fillText(`${z}m`, 6, y + 3);
   }
 
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
   for (const s of state.sorties) {
     const c = colorFor(s.id);
-    if ($("showEarliest").checked) {
+    if ($("showEarliest").checked && !state.activeBatch) {
       drawProfileLine(ctx, s, 0, g, c, zy, true);
     }
-    if (solvedOff && $("showSolved").checked) {
-      drawProfileLine(ctx, s, solvedOff[s.id] || 0, g, c, zy, false);
+    const off = displayOffset(s);
+    if ($("showSolved").checked && off !== null) {
+      drawProfileLine(ctx, s, off, g, c, zy, false);
     }
   }
 }
@@ -609,12 +872,17 @@ function renderLegend() {
   }
   const cf = document.createElement("span");
   cf.className = "lg";
-  cf.innerHTML = `<span style="color:#ff5d6c">✕</span> 冲突见证点（最早起飞）`;
+  cf.innerHTML = `<span style="color:#ff5d6c">✕</span> ${state.activeBatch ? "t 及之后预警冲突" : "冲突见证点（最早起飞）"}`;
   box.appendChild(cf);
 }
 
 function renderAll() {
-  if (!state.scenario) return;
+  if (!state.scenario) {
+    $("batchCard").classList.add("hidden");
+    $("resultPanel").classList.add("hidden");
+    renderBatchList();
+    return;
+  }
   updateMaxTime();
   renderLegend();
   renderMap();
@@ -622,6 +890,8 @@ function renderAll() {
   renderProfile();
   renderSortiePanel();
   renderResultPanel();
+  renderBatchList();
+  renderBatchPanel();
 }
 
 function escapeHtml(t) {
@@ -670,6 +940,7 @@ $("savePlanBtn").addEventListener("click", async () => {
     await fetchHistory();
   } catch (err) { toast("保存失败：" + err.message); }
 });
+$("createBatchBtn").addEventListener("click", createBatch);
 
 $("closeResult").addEventListener("click", () => $("resultPanel").classList.add("hidden"));
 
@@ -685,6 +956,13 @@ $("timeScrub").addEventListener("input", (e) => {
 
 ["safetyRadius", "safetyHeight"].forEach((id) => {
   $(id).addEventListener("change", () => {
+    if (state.activeBatch) {
+      toast("批次安全阈值已冻结，不能在此重算");
+      const b = state.activeBatch;
+      $("safetyRadius").value = b.safety_radius;
+      $("safetyHeight").value = b.safety_height;
+      return;
+    }
     if (state.scenarioId) solve(collectLocks());
   });
 });
@@ -695,4 +973,7 @@ window.addEventListener("resize", () => { if (state.scenario) renderAll(); });
   try {
     await fetchHistory();
   } catch (e) { /* empty DB */ }
+  try {
+    await fetchBatches();
+  } catch (e) { /* batch API unavailable during startup error */ }
 })();
